@@ -13,21 +13,6 @@
         printf ("%s %d CUDA: %s\n", __FILE__,  __LINE__, cudaGetErrorString(e));		\
 }
 
-// naive version
-__global__ void Sgemm_v0(const float *A, const float *B, float *C, 
-    int M, int K, int N) {
-    int tx = blockIdx.x * blockDim.x + threadIdx.x;
-    int ty = blockIdx.y * blockDim.y + threadIdx.y;
-    if(ty < M && tx < N) {
-        float c = 0;
-        for(int i = 0; i < K; ++i){
-            c += A[ty * K + i] * B[i * N + tx];
-        }
-        C[ty * N + tx] = c;
-    }
-}
-
-
 // just tile
 template< int bm, int bk, int bn, int rm, int rn > 
 __global__ void Sgemm_v1( 
@@ -46,10 +31,9 @@ __global__ void Sgemm_v1(
     // the threads number in Block of X,Y
     const int THREAD_X_PER_BLOCK = bn / rn;
     const int THREAD_Y_PER_BLOCK = bm / rm;
-    // 256
+
     const int THREAD_NUM_PER_BLOCK = THREAD_X_PER_BLOCK * THREAD_Y_PER_BLOCK;
 
-    // thread id in cur Block
     const int tid = ty * THREAD_X_PER_BLOCK + tx;
 
     __shared__ float As[bm][bk];
@@ -166,14 +150,15 @@ int main(int argc, char** argv) {
     double gigaFlops[2] = {0, 0};
     double flopsPerMatrixMul = 2.0 * M * N * K;
 
-    // generate A
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<> distrib(0, 1);
+    // generate A, B
     for( int i = 0; i < M * K; i++ ){
-        h_A[i] = i / 7;
+        h_A[i] = distrib(gen);
     }
-
-    // generate B
     for( int i = 0; i < K * N; i++ ) {
-        h_B[i] = i % 7;
+        h_B[i] = distrib(gen);
     }
 
     checkCudaErrors(cudaMemcpy( d_A, h_A, bytes_A, cudaMemcpyHostToDevice));

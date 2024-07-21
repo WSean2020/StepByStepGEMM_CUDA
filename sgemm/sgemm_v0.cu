@@ -61,14 +61,15 @@ int main(int argc, char** argv) {
     double gigaFlops[2] = {0, 0};
     double flopsPerMatrixMul = 2.0 * M * N * K;
 
-    // generate A
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<> distrib(0, 1);
+    // generate A, B
     for( int i = 0; i < M * K; i++ ){
-        h_A[i] = i / 7;
+        h_A[i] = distrib(gen);
     }
-
-    // generate B
     for( int i = 0; i < K * N; i++ ) {
-        h_B[i] = i % 7;
+        h_B[i] = distrib(gen);
     }
 
     checkCudaErrors(cudaMemcpy( d_A, h_A, bytes_A, cudaMemcpyHostToDevice));
