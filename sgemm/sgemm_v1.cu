@@ -4,7 +4,7 @@
 
 #define OFFSET(row, col, ld) ((row) * (ld) + (col))
 
-#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+#define FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
 #define checkCudaErrors(func)				\
 {									\
@@ -60,33 +60,39 @@ __global__ void Sgemm_v1(
 
     #pragma unroll
     for(int i = 0; i < K; i += bk){
+        // Load tiles of A, B from global mem -> shared mem
         #pragma unroll
         for(int j = 0; j < bm; j += A_TILE_ROW_STRIDE){
-            FETCH_FLOAT4(As[A_TILE_ROW_START + j][A_TILE_COL]) = FETCH_FLOAT4(A[OFFSET(
+            FLOAT4(As[A_TILE_ROW_START + j][A_TILE_COL]) = FLOAT4(A[OFFSET(
                 bm * by + A_TILE_ROW_START + j, 
                 i + A_TILE_COL, 
                 K )]);
         }
         #pragma unroll
         for ( int j = 0 ; j < bk; j += B_TILE_ROW_STRIDE) {
-            FETCH_FLOAT4(Bs[B_TILE_ROW_START + j][B_TILE_COL]) = FETCH_FLOAT4(B[OFFSET(
+            FLOAT4(Bs[B_TILE_ROW_START + j][B_TILE_COL]) = FLOAT4(B[OFFSET(
                     i + B_TILE_ROW_START + j, // row
                     bn * bx + B_TILE_COL, // col
                     N )]);
         }
         __syncthreads();
+        // shared mem -> Reg file
         #pragma unroll
         for(int j = 0; j < bk; j++){
             #pragma unroll
             for(int k = 0; k < rm; k++){
-                // serious bank conlficts happens
+                // Serious bank conlficts happens here.
+                // Next, we can trans(A) -> As to avoid bank conlficts. We can also benefit from the trans ops.
+                // The best access pattern is obtained when all threads in the same warp access consecutive cells.
+                // The size of a row in B_tile : bn = 128 -> 32 * 4 , each thread of a warp access a FLOAT4.
                 a_frag[k] = As[ty * rm + k][j];
             }
             #pragma unroll
             for(int k = 0; k < rn; k += 4){
-                FETCH_FLOAT4(b_frag[k]) = FETCH_FLOAT4(Bs[j][rn * tx + k]);
+                FLOAT4(b_frag[k]) = FLOAT4(Bs[j][rn * tx + k]);
             }
             __syncthreads();
+            // Each thread calculate a fragment
             #pragma unroll
             for(int p = 0; p < rm; p++){
                 #pragma unroll
@@ -97,15 +103,15 @@ __global__ void Sgemm_v1(
         }
     }
     __syncthreads();
-    // c_frag write back to C
+    // Results write back to C
     #pragma unroll
     for (int thread_y = 0; thread_y < rm; thread_y++) {
         #pragma unroll
         for (int thread_x = 0; thread_x < rn; thread_x += 4) {
-            FETCH_FLOAT4(C[OFFSET(
+            FLOAT4(C[OFFSET(
                 bm * by + ty * rm + thread_y,
                 bn * bx + tx * rn + thread_x,
-                N )]) = FETCH_FLOAT4(c_frag[thread_y][thread_x]);
+                N )]) = FLOAT4(c_frag[thread_y][thread_x]);
         }
     }
 }
@@ -153,7 +159,6 @@ int main(int argc, char** argv) {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<> distrib(0, 1);
-    // generate A, B
     for( int i = 0; i < M * K; i++ ){
         h_A[i] = distrib(gen);
     }
@@ -172,7 +177,6 @@ int main(int argc, char** argv) {
     int nIter = 10;
 
     checkCudaErrors(cudaEventRecord(start));
-    // make sure these four parameters are positive integers
     dim3 dimBlock(bn / rn, bm / rm);
     dim3  dimGrid(N  / bn, M  / bm);
     for (int run = 0 ; run < nIter; run++) {
@@ -191,7 +195,7 @@ int main(int argc, char** argv) {
         msecPerMatrixMul[0],
         flopsPerMatrixMul);
 
-    // cublas
+    // cuBLAS
     cublasHandle_t blas_handle;  
     cublasCreate(&blas_handle);
     float alpha = 1.0;
@@ -223,7 +227,7 @@ int main(int argc, char** argv) {
         msecPerMatrixMul[1],
         flopsPerMatrixMul);
     
-    double eps = 1.e-6;  // machine zero
+    double eps = 1.e-6;
     bool correct = true;
     for (int i = 0; i < M * N; i++) {
         int row = i / N;
@@ -241,9 +245,8 @@ int main(int argc, char** argv) {
     }
 
     printf("%s\n", correct ? "Result= PASS" : "Result= FAIL");
-    printf("ratio= %f\n", gigaFlops[0] / gigaFlops[1]);
+    printf("Achieve %.2f %% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
     
-    // Free Memory
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
