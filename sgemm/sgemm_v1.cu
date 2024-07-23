@@ -13,7 +13,8 @@
         printf ("%s %d CUDA: %s\n", __FILE__,  __LINE__, cudaGetErrorString(e));		\
 }
 
-// just tile
+// Just tiling and TransA -> As
+// Achieve cuBLAS 50~60% performance
 template< int bm, int bk, int bn, int rm, int rn > 
 __global__ void Sgemm_v1( 
     float* __restrict__ A,
@@ -36,7 +37,8 @@ __global__ void Sgemm_v1(
 
     const int tid = ty * THREAD_X_PER_BLOCK + tx;
 
-    __shared__ float As[bm][bk];
+    // Trans A_tile -> As
+    __shared__ float As[bk][bm];
     __shared__ float Bs[bk][bn];
 
     float a_frag[rm];
@@ -63,10 +65,14 @@ __global__ void Sgemm_v1(
         // Load tiles of A, B from global mem -> shared mem
         #pragma unroll
         for(int j = 0; j < bm; j += A_TILE_ROW_STRIDE){
-            FLOAT4(As[A_TILE_ROW_START + j][A_TILE_COL]) = FLOAT4(A[OFFSET(
+            int ldg_index = OFFSET(
                 bm * by + A_TILE_ROW_START + j, 
                 i + A_TILE_COL, 
-                K )]);
+                K );
+            As[A_TILE_COL    ][A_TILE_ROW_START + j] = A[ldg_index    ];
+            As[A_TILE_COL + 1][A_TILE_ROW_START + j] = A[ldg_index + 1];
+            As[A_TILE_COL + 2][A_TILE_ROW_START + j] = A[ldg_index + 2];
+            As[A_TILE_COL + 3][A_TILE_ROW_START + j] = A[ldg_index + 3];
         }
         #pragma unroll
         for ( int j = 0 ; j < bk; j += B_TILE_ROW_STRIDE) {
@@ -80,12 +86,8 @@ __global__ void Sgemm_v1(
         #pragma unroll
         for(int j = 0; j < bk; j++){
             #pragma unroll
-            for(int k = 0; k < rm; k++){
-                // Serious bank conlficts happens here.
-                // Next, we can trans(A) -> As to avoid bank conlficts. We can also benefit from the trans ops.
-                // The best access pattern is obtained when all threads in the same warp access consecutive cells.
-                // The size of a row in B_tile : bn = 128 -> 32 * 4 , each thread of a warp access a FLOAT4.
-                a_frag[k] = As[ty * rm + k][j];
+            for(int k = 0; k < rm; k += 4){
+                FLOAT4(a_frag[k]) = FLOAT4(As[j][ty * rm + k]);
             }
             #pragma unroll
             for(int k = 0; k < rn; k += 4){
@@ -245,7 +247,7 @@ int main(int argc, char** argv) {
     }
 
     printf("%s\n", correct ? "Result= PASS" : "Result= FAIL");
-    printf("Achieve %.2f %% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
+    printf("Achieve %.2f%% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
     
     cudaFree(d_A);
     cudaFree(d_B);

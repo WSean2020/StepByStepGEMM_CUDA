@@ -9,7 +9,8 @@
         printf ("%s %d CUDA: %s\n", __FILE__,  __LINE__, cudaGetErrorString(e));		\
 }
 
-// naive version
+// Naive version
+// Achieve below cuBLAS 10% performance
 __global__ void Sgemm_v0(
     const float *A, 
     const float *B, 
@@ -146,7 +147,7 @@ int main(int argc, char** argv) {
     }
 
     printf("%s\n", correct ? "Result= PASS" : "Result= FAIL");
-    printf("Achieve %.2f %% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
+    printf("Achieve %.2f%% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
     
     cudaFree(d_A);
     cudaFree(d_B);
