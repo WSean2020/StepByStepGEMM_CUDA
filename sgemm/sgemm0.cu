@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
     }
 
     printf("%s\n", correct ? "Result= PASS" : "Result= FAIL");
-    printf("Achieve %.2f%% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
+    printf("Naive version achieve %.2f%% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
     
     cudaFree(d_A);
     cudaFree(d_B);

@@ -13,10 +13,9 @@
         printf ("%s %d CUDA: %s\n", __FILE__,  __LINE__, cudaGetErrorString(e));		\
 }
 
-// Just tiling and TransA -> As
-// Achieve cuBLAS 50~60% performance
+// Ping-pong / Prefetch / Double buffer
 template< int bm, int bk, int bn, int rm, int rn > 
-__global__ void Sgemm_v1( 
+__global__ void Sgemm_v2( 
     float* __restrict__ A,
     float* __restrict__ B,
     float *  C, 
@@ -37,13 +36,19 @@ __global__ void Sgemm_v1(
 
     const int tid = ty * THREAD_X_PER_BLOCK + tx;
 
-    // Trans A_tile -> As
-    __shared__ float As[bk][bm];
-    __shared__ float Bs[bk][bn];
+    // Double buffer
+    __shared__ float As[2][bk][bm];
+    __shared__ float Bs[2][bk][bn];
+    float frag_a[2][rm];
+    float frag_b[2][rn];
 
-    float a_frag[rm];
-    float b_frag[rn];
-    float c_frag[rm][rn] = {0.0};
+    float frag_c[rm][rn] = {0.0};
+
+    // registers load global memory
+    const int ldg_num_a = bm * bk / THREAD_NUM_PER_BLOCK;
+    const int ldg_num_b = bk * bn / THREAD_NUM_PER_BLOCK;
+    float ldg_a_reg[ldg_num_a];
+    float ldg_b_reg[ldg_num_b];
 
     // threads number in one row
     const int A_TILE_THREAD_PER_ROW = bk / 4;
@@ -59,61 +64,152 @@ __global__ void Sgemm_v1(
     // row stride that thread uses to load multiple rows of a tile
     const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
     const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
+    // make a block all threads' A and B point to the same right place 
+    A = &A[(bm * by)* K];
+    B = &B[bn * bx];
 
+    // transfer first tile from global mem to shared mem
+    // load A from global memory to shared memory
     #pragma unroll
-    for(int i = 0; i < K; i += bk){
-        // Load tiles of A, B from global mem -> shared mem
-        #pragma unroll
-        for(int j = 0; j < bm; j += A_TILE_ROW_STRIDE){
-            int ldg_index = OFFSET(
-                bm * by + A_TILE_ROW_START + j, 
-                i + A_TILE_COL, 
-                K );
-            As[A_TILE_COL    ][A_TILE_ROW_START + j] = A[ldg_index    ];
-            As[A_TILE_COL + 1][A_TILE_ROW_START + j] = A[ldg_index + 1];
-            As[A_TILE_COL + 2][A_TILE_ROW_START + j] = A[ldg_index + 2];
-            As[A_TILE_COL + 3][A_TILE_ROW_START + j] = A[ldg_index + 3];
-        }
-        #pragma unroll
-        for ( int j = 0 ; j < bk; j += B_TILE_ROW_STRIDE) {
-            FLOAT4(Bs[B_TILE_ROW_START + j][B_TILE_COL]) = FLOAT4(B[OFFSET(
-                    i + B_TILE_ROW_START + j, // row
-                    bn * bx + B_TILE_COL, // col
+    for ( int i = 0 ; i < bm ; i += A_TILE_ROW_STRIDE) {
+        int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+        FLOAT4(ldg_a_reg[ldg_index]) = FLOAT4(A[OFFSET(
+            A_TILE_ROW_START + i, // row
+            A_TILE_COL, // col
+            K )]);
+        __syncthreads();
+        As[0][A_TILE_COL  ][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index  ];
+        As[0][A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+1];
+        As[0][A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+2];
+        As[0][A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+3];
+        __syncthreads();
+    }
+    // load B from global memory to shared memory
+    #pragma unroll
+    for ( int i = 0 ; i < bk; i += B_TILE_ROW_STRIDE) {
+        FLOAT4(Bs[0][B_TILE_ROW_START + i][B_TILE_COL]) = FLOAT4(B[OFFSET(
+                B_TILE_ROW_START + i, // row
+                B_TILE_COL, // col
+                N )]);
+    }
+    __syncthreads();
+    // load A from shared memory to register
+    #pragma unroll
+    for (int thread_y = 0; thread_y < rm; thread_y += 4) {
+        FLOAT4(frag_a[0][thread_y]) = FLOAT4(As[0][0][rm * ty + thread_y]);
+    }
+    // load B from shared memory to register
+    #pragma unroll
+    for (int thread_x = 0; thread_x < rn; thread_x += 4) {
+        FLOAT4(frag_b[0][thread_x]) = FLOAT4(Bs[0][0][rn * tx + thread_x]);
+    }
+    __syncthreads();
+    // Pingpong flag
+    int write_stage_idx = 1;
+    int tile_idx = 0;
+    do{
+        tile_idx += bk;
+        // If next tile exists, pre-load it from global mem to reg
+        if(tile_idx < K){
+            #pragma unroll
+            for ( int i = 0 ; i < bm; i += A_TILE_ROW_STRIDE) {
+                int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+                FLOAT4(ldg_a_reg[ldg_index]) = FLOAT4(A[OFFSET(
+                    A_TILE_ROW_START + i, // row
+                    A_TILE_COL + tile_idx, // col
+                    K )]);
+            }
+            #pragma unroll
+            for ( int i = 0 ; i < bk; i += B_TILE_ROW_STRIDE) {
+                int ldg_index = i / B_TILE_ROW_STRIDE * 4;
+                FLOAT4(ldg_b_reg[ldg_index]) = FLOAT4(B[OFFSET(
+                    tile_idx + B_TILE_ROW_START + i, // row
+                    B_TILE_COL, // col
                     N )]);
+            }
         }
         __syncthreads();
-        // shared mem -> Reg file
+        // diff to write_stage_idx
+        int load_stage_idx = write_stage_idx ^ 1;
+
         #pragma unroll
-        for(int j = 0; j < bk; j++){
+        for(int j = 0; j < bk - 1; j++){
+            // load next tile from shared mem to register 
+            // load A from shared memory to register
             #pragma unroll
-            for(int k = 0; k < rm; k += 4){
-                FLOAT4(a_frag[k]) = FLOAT4(As[j][ty * rm + k]);
+            for (int thread_y = 0; thread_y < rm; thread_y += 4) {
+                FLOAT4(frag_a[(j+1)%2][thread_y]) = FLOAT4(As[load_stage_idx][j+1][rm * ty + thread_y]);
             }
+            // load B from shared memory to register
             #pragma unroll
-            for(int k = 0; k < rn; k += 4){
-                FLOAT4(b_frag[k]) = FLOAT4(Bs[j][rn * tx + k]);
+            for (int thread_x = 0; thread_x < rn; thread_x += 4) {
+                FLOAT4(frag_b[(j+1)%2][thread_x]) = FLOAT4(Bs[load_stage_idx][j+1][rn * tx + thread_x]);
             }
             __syncthreads();
-            // Each thread calculate a fragment
+            // compute C rn x rm
             #pragma unroll
-            for(int p = 0; p < rm; p++){
+            for (int thread_y = 0; thread_y < rm; ++thread_y) {
                 #pragma unroll
-                for(int q = 0; q < rn; q++){
-                    c_frag[p][q] += a_frag[p] * b_frag[q];
+                for (int thread_x = 0; thread_x < rn; ++thread_x) {
+                    frag_c[thread_y][thread_x] += frag_a[j % 2][thread_y] * frag_b[j % 2][thread_x];
                 }
             }
         }
-    }
-    __syncthreads();
-    // Results write back to C
-    #pragma unroll
-    for (int thread_y = 0; thread_y < rm; thread_y++) {
+        __syncthreads();
+        if(tile_idx < K){
+            // load A from reg to shared memory
+            #pragma unroll
+            for ( int i = 0 ; i < bm ; i += A_TILE_ROW_STRIDE) {
+                int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+                As[write_stage_idx][A_TILE_COL  ][A_TILE_ROW_START + i] = ldg_a_reg[ldg_index  ];
+                As[write_stage_idx][A_TILE_COL+1][A_TILE_ROW_START + i] = ldg_a_reg[ldg_index+1];
+                As[write_stage_idx][A_TILE_COL+2][A_TILE_ROW_START + i] = ldg_a_reg[ldg_index+2];
+                As[write_stage_idx][A_TILE_COL+3][A_TILE_ROW_START + i] = ldg_a_reg[ldg_index+3];
+            }
+            // load B from reg to shared memory
+            #pragma unroll
+            for ( int i = 0 ; i < bk; i += B_TILE_ROW_STRIDE) {
+                int ldg_index = i / B_TILE_ROW_STRIDE * 4;
+                FLOAT4(Bs[write_stage_idx][B_TILE_ROW_START + i][B_TILE_COL]) = FLOAT4(ldg_b_reg[ldg_index]);
+            }
+            // use double buffer, only need one sync
+            __syncthreads();
+            // switch flag
+            write_stage_idx ^= 1;
+        }
+
+        // load first tile from shared mem to register of next iter
+        // load A from shared memory to register
+        #pragma unroll
+        for (int thread_y = 0; thread_y < rm; thread_y += 4) {
+            FLOAT4(frag_a[0][thread_y]) = FLOAT4(As[load_stage_idx^1][0][rm * ty + thread_y]);
+        }
+        // load B from shared memory to register
         #pragma unroll
         for (int thread_x = 0; thread_x < rn; thread_x += 4) {
+            FLOAT4(frag_b[0][thread_x]) = FLOAT4(Bs[load_stage_idx^1][0][rn * tx + thread_x]);
+        }
+        __syncthreads();
+        //compute last tile mma rn x rm
+        #pragma unroll
+        for (int thread_y = 0; thread_y < rm; ++thread_y) {
+            #pragma unroll
+            for (int thread_x = 0; thread_x < rn; ++thread_x) {
+                frag_c[thread_y][thread_x] += frag_a[1][thread_y] * frag_b[1][thread_x];
+            }
+        }
+        __syncthreads();
+    }while(tile_idx < K);
+    __syncthreads();
+    // store back to C
+    #pragma unroll
+    for (int thread_y = 0; thread_y < rm; ++thread_y) {
+        #pragma unroll
+        for (int thread_x = 0; thread_x < rn; thread_x+=4) {
             FLOAT4(C[OFFSET(
                 bm * by + ty * rm + thread_y,
                 bn * bx + tx * rn + thread_x,
-                N )]) = FLOAT4(c_frag[thread_y][thread_x]);
+                N)]) = FLOAT4(frag_c[thread_y][thread_x]);
         }
     }
 }
@@ -182,7 +278,7 @@ int main(int argc, char** argv) {
     dim3 dimBlock(bn / rn, bm / rm);
     dim3  dimGrid(N  / bn, M  / bm);
     for (int run = 0 ; run < nIter; run++) {
-        Sgemm_v1<bm, bk, bn, rm, rn><<< dimGrid, dimBlock >>>(d_A, d_B, d_C, M, K, N);
+        Sgemm_v2<bm, bk, bn, rm, rn><<< dimGrid, dimBlock >>>(d_A, d_B, d_C, M, K, N);
     }
     checkCudaErrors(cudaEventRecord(stop));
     checkCudaErrors(cudaEventSynchronize(stop));
@@ -247,7 +343,7 @@ int main(int argc, char** argv) {
     }
 
     printf("%s\n", correct ? "Result= PASS" : "Result= FAIL");
-    printf("Achieve %.2f%% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
+    printf("Version2 achieve %.2f%% performance of cuBLAS.\n", 100 * gigaFlops[0] / gigaFlops[1]);
     
     cudaFree(d_A);
     cudaFree(d_B);
